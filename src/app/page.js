@@ -1,7 +1,7 @@
 // src/app/page.js
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { ATTACK_SUITE } from "@/lib/attackSuite";
 
 const C = {
@@ -28,14 +28,37 @@ export default function Home() {
   const [agentReply, setAgentReply] = useState(null);
   const [loading, setLoading] = useState(false);
   const [log, setLog] = useState([]);
+  const [logPage, setLogPage] = useState(1);
+  const LOG_PAGE_SIZE = 8;
   const [suite, setSuite] = useState(null);
   const [suiteRunning, setSuiteRunning] = useState(false);
   const logIdRef = useRef(0);
 
   const pushLog = (entry) => {
     logIdRef.current += 1;
-    setLog((prev) => [{ id: logIdRef.current, ts: new Date(), ...entry }, ...prev].slice(0, 50));
+    setLog((prev) => [{ id: logIdRef.current, ts: Date.now(), ...entry }, ...prev].slice(0, 50));
+    setLogPage(1);
   };
+
+  // Load the persisted log from Redis on first paint, so a cold visitor
+  // (a judge opening the link) sees history, not an empty table.
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch("/api/log");
+        const data = await res.json();
+        if (data?.entries?.length) {
+          setLog(data.entries.map((e, i) => ({ id: `r${i}`, ...e })));
+        }
+      } catch {}
+    })();
+  }, []);
+
+  async function clearLog() {
+    try { await fetch("/api/log", { method: "DELETE" }); } catch {}
+    setLog([]);
+    setLogPage(1);
+  }
 
   async function screen() {
     if (!text.trim()) return;
@@ -49,6 +72,7 @@ export default function Home() {
         body: JSON.stringify({ text }),
       });
       const g = await gRes.json();
+      g.enforcedAtScreen = isProtected; // snapshot the toggle at the moment of screening
       setResult(g);
       pushLog({ text, verdict: g.verdict, category: g.category, layer: g.layer, ms: g.ms });
 
@@ -95,6 +119,7 @@ export default function Home() {
     <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" }}>
       <style>{`
         * { box-sizing: border-box; }
+        html { overflow-y: scroll; scrollbar-gutter: stable; }
         @keyframes stamp { 0% { transform: scale(0.6); opacity: 0; } 60% { transform: scale(1.08); } 100% { transform: scale(1); opacity: 1; } }
         @keyframes flow { 0% { left: -20%; } 100% { left: 120%; } }
         @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
@@ -167,7 +192,7 @@ export default function Home() {
               <Pipeline result={result} loading={loading} />
               {result && result.verdict !== "error" && (
                 <div style={{ display: "grid", gap: 12 }}>
-                  <VerdictCard result={result} enforced={isProtected} />
+                  <VerdictCard result={result} enforced={result.enforcedAtScreen} />
                   {agentReply && <AgentReplyCard agentReply={agentReply} isProtected={isProtected} />}
                 </div>
               )}
@@ -224,12 +249,22 @@ export default function Home() {
 
         {/* Live log */}
         <section style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 14, padding: 22 }}>
-          <h2 style={{ margin: "0 0 4px", fontSize: 15, fontWeight: 650 }}>Live verdict log</h2>
-          <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>Every screened request, newest first.</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+            <div>
+              <h2 style={{ margin: "0 0 4px", fontSize: 15, fontWeight: 650 }}>Live verdict log</h2>
+              <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>Every screened request, newest first. Persisted in Redis.</div>
+            </div>
+            {log.length > 0 && (
+              <button className="btn mono" onClick={clearLog}
+                style={{ background: "transparent", color: C.muted, border: `1px solid ${C.border}`, borderRadius: 8, padding: "6px 12px", fontSize: 11.5 }}>
+                clear log
+              </button>
+            )}
+          </div>
           {log.length === 0 ? (
             <div className="mono" style={{ color: C.faint, fontSize: 12.5, padding: "18px 0" }}>No requests screened yet. Screen a request or run the attack suite.</div>
           ) : (
-            <div style={{ overflowX: "auto" }}>
+            <div style={{ overflowX: "auto", overflowY: "hidden" }}>
               <table className="mono" style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                 <thead>
                   <tr style={{ color: C.faint, textAlign: "left" }}>
@@ -241,17 +276,47 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody>
-                  {log.map((l) => (
+                  {log
+                    .slice((logPage - 1) * LOG_PAGE_SIZE, logPage * LOG_PAGE_SIZE)
+                    .map((l) => (
                     <tr key={l.id} className="row" style={{ borderTop: `1px solid ${C.border}` }}>
-                      <td style={{ padding: "8px 10px", color: C.faint, whiteSpace: "nowrap" }}>{l.ts.toLocaleTimeString()}</td>
+                      <td style={{ padding: "8px 10px", color: C.faint, whiteSpace: "nowrap" }}>{new Date(l.ts).toLocaleTimeString()}</td>
                       <td style={{ padding: "8px 10px", maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.muted }}>{l.text}</td>
                       <td style={{ padding: "8px 10px", color: verdictColor(l.verdict), fontWeight: 700 }}>{l.verdict}</td>
-                      <td style={{ padding: "8px 10px", color: C.muted }}>{l.layer || "—"}</td>
+                      <td style={{ padding: "8px 10px", color: C.muted }}>{l.layer || "—"}{l.cached ? " ·cached" : ""}</td>
                       <td style={{ padding: "8px 10px", color: C.faint }}>{l.ms ?? "—"}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {log.length > LOG_PAGE_SIZE && (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 14, gap: 12 }}>
+                  <span className="mono" style={{ fontSize: 11.5, color: C.faint }}>
+                    {(logPage - 1) * LOG_PAGE_SIZE + 1}–{Math.min(logPage * LOG_PAGE_SIZE, log.length)} of {log.length}
+                  </span>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      className={logPage === 1 ? "mono" : "btn mono"}
+                      onClick={() => setLogPage((p) => Math.max(1, p - 1))}
+                      disabled={logPage === 1}
+                      style={{ background: "transparent", color: logPage === 1 ? C.faint : C.text, border: `1px solid ${C.border}`, borderRadius: 7, padding: "5px 12px", fontSize: 11.5, cursor: logPage === 1 ? "not-allowed" : "pointer", opacity: logPage === 1 ? 0.45 : 1 }}
+                    >
+                      ← prev
+                    </button>
+                    <span className="mono" style={{ fontSize: 11.5, color: C.muted, alignSelf: "center" }}>
+                      {logPage} / {Math.ceil(log.length / LOG_PAGE_SIZE)}
+                    </span>
+                    <button
+                      className={logPage >= Math.ceil(log.length / LOG_PAGE_SIZE) ? "mono" : "btn mono"}
+                      onClick={() => setLogPage((p) => Math.min(Math.ceil(log.length / LOG_PAGE_SIZE), p + 1))}
+                      disabled={logPage >= Math.ceil(log.length / LOG_PAGE_SIZE)}
+                      style={{ background: "transparent", color: logPage >= Math.ceil(log.length / LOG_PAGE_SIZE) ? C.faint : C.text, border: `1px solid ${C.border}`, borderRadius: 7, padding: "5px 12px", fontSize: 11.5, cursor: logPage >= Math.ceil(log.length / LOG_PAGE_SIZE) ? "not-allowed" : "pointer", opacity: logPage >= Math.ceil(log.length / LOG_PAGE_SIZE) ? 0.45 : 1 }}
+                    >
+                      next →
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </section>
@@ -314,6 +379,7 @@ function VerdictCard({ result, enforced }) {
         <span className="mono" style={{ fontSize: 14, fontWeight: 800, color: col, textTransform: "uppercase", letterSpacing: "0.04em" }}>{result.verdict}</span>
         <span className="mono" style={{ fontSize: 11.5, color: C.muted, border: `1px solid ${C.border}`, borderRadius: 5, padding: "2px 7px" }}>{result.category}</span>
         <span className="mono" style={{ fontSize: 11.5, color: C.muted }}>caught by {result.layer} layer</span>
+        {result.cached && <span className="mono" style={{ fontSize: 10.5, fontWeight: 700, color: C.accent, border: `1px solid ${C.accent}`, borderRadius: 5, padding: "2px 7px" }}>CACHED</span>}
         <span className="mono" style={{ fontSize: 10.5, fontWeight: 700, color: enforced ? C.allow : C.redact, border: `1px solid ${enforced ? C.allow : C.redact}`, borderRadius: 5, padding: "2px 7px" }}>
           {enforced ? "ENFORCED" : "ADVISORY · NOT ENFORCED"}
         </span>
